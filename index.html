@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Menger Lab — WebGL2</title><style>
 :root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif}*{box-sizing:border-box}body{margin:0;background:#10141c;color:#e7edf5}header{padding:12px 16px;border-bottom:1px solid #354055}h1{font-size:19px;margin:0}small,.muted{color:#aab7ca}main{display:grid;grid-template-columns:minmax(0,1fr) 295px;min-height:calc(100dvh - 56px)}#view{width:100%;height:100%;min-height:400px;display:block;touch-action:none;background:#070b12}aside{padding:14px;overflow:auto;background:#1a2230}label{display:block;margin:12px 0 4px;font-size:13px}input,select,button{font:inherit;color:inherit}input,select{width:100%;padding:8px;background:#101824;border:1px solid #47556a;border-radius:6px}button{padding:9px 12px;border:1px solid #62748b;border-radius:6px;background:#2b3b52;cursor:pointer}button:disabled{opacity:.5}button.primary{background:#315e94}buttonrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}buttonrow button{flex:1}#status{white-space:pre-wrap;font:12px/1.5 ui-monospace,monospace;color:#c3d1e1;margin-top:14px}.note{font-size:12px;line-height:1.5;color:#b3bfd0} @media(max-width:760px){main{display:flex;flex-direction:column}#view{height:54dvh;min-height:280px}aside{overflow:visible}}
-</style></head><body><header><h1>Menger Lab <small>WebGL2 · offline tile renderer</small></h1></header><main><canvas id="view"></canvas><aside>
+</style></head><body><header><h1>Menger Lab <small>WebGL2 · single-pass diagnostic v0.3</small></h1></header><main><canvas id="view"></canvas><aside>
 <label>Iterations <output id="depthValue">8</output></label><input id="depth" type="range" min="0" max="24" value="8">
 <label>Zoom (camera distance)</label><input id="distance" type="number" value="2.8" min="0.000001" step="any">
 <label>Look-at X</label><input id="tx" type="number" value="0" step="any">
@@ -13,7 +13,7 @@
 <buttonrow><button id="preview" class="primary">Preview</button><button id="render">Render PNG</button></buttonrow>
 <buttonrow><button id="bench">Benchmark</button><button id="cancel">Cancel</button><button id="reset">Reset camera</button></buttonrow>
 <div id="status" role="status">Initializing…</div>
-<p class="note">Drag to orbit, pinch or scroll to zoom. PNG rendering uses tiles to limit GPU memory, but the final image still uses system memory. For very deep detail, aim the camera at a specific opening and zoom progressively. This initial shader uses 32-bit floating point: iteration counts above ~12–15 may not produce new reliable geometric detail in a fixed global coordinate system.</p>
+<p class="note">Drag to orbit, pinch or scroll to zoom. PNG diagnostic export renders in one pass (no tiles), up to 4096 pixels per side. For very deep detail, aim the camera at a specific opening and zoom progressively. This initial shader uses 32-bit floating point: iteration counts above ~12–15 may not produce new reliable geometric detail in a fixed global coordinate system.</p>
 <p class="note">The algorithm is an approximate distance-estimator ray marcher, not exact hierarchical traversal. Benchmark timings include GPU completion and pixel readback; they are not pure GPU kernel timings.</p>
 </aside></main>
 <script>
@@ -80,7 +80,51 @@ function drawTile(tileW,tileH,fullW,fullH,x,y){gl.viewport(0,0,tileW,tileH);unif
 function preview(keepStatus=false){if(job)return;const rect=canvas.getBoundingClientRect(),scale=Math.min(devicePixelRatio||1,1.5),max=1200;const k=Math.min(1,max/(rect.width*scale),max/(rect.height*scale));canvas.width=Math.max(1,Math.round(rect.width*scale*k));canvas.height=Math.max(1,Math.round(rect.height*scale*k));gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.useProgram(program);drawTile(canvas.width,canvas.height,canvas.width,canvas.height,0,0);if(!keepStatus)status.textContent=`Preview: ${canvas.width}×${canvas.height} | depth ${$('depth').value}`}
 function framebuffer(size){const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,size,size,0,gl.RGBA,gl.UNSIGNED_BYTE,null);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('Framebuffer incomplete');return {fb,tex}}
 const yieldFrame=()=>new Promise(resolve=>setTimeout(resolve,0));
-async function render(benchmark=false){if(job)return;const w=benchmark?768:Math.floor(+$('outW').value),h=benchmark?512:Math.floor(+$('outH').value),size=benchmark?256:+$('tile').value;if(w<64||h<64||w>8192||h>8192){status.textContent='Output dimensions must be between 64 and 8192.';return}if(size>gl.getParameter(gl.MAX_TEXTURE_SIZE)){status.textContent='Tile exceeds GPU texture limit.';return}const run={cancel:false};job=run;$('render').disabled=$('bench').disabled=true;let res=null;const start=performance.now();try{res=framebuffer(size);gl.bindFramebuffer(gl.FRAMEBUFFER,res.fb);const out=benchmark?null:document.createElement('canvas');if(out){out.width=w;out.height=h}const ctx=out?.getContext('2d');if(out&&!ctx)throw Error('2D canvas unavailable');let n=0;const total=Math.ceil(w/size)*Math.ceil(h/size);gl.pixelStorei(gl.PACK_ALIGNMENT,1);for(let y=0;y<h;y+=size){for(let x=0;x<w;x+=size){if(run.cancel)throw Error('Cancelled');const tw=Math.min(size,w-x),th=Math.min(size,h-y);drawTile(tw,th,w,h,x,y);gl.finish();if(gl.isContextLost())throw Error('WebGL context lost: reduce tile size or depth');const tilePixels=new Uint8Array(tw*th*4);gl.readPixels(0,0,tw,th,gl.RGBA,gl.UNSIGNED_BYTE,tilePixels);const err=gl.getError();if(err!==gl.NO_ERROR)throw Error('WebGL readback error '+err);if(out){const im=ctx.createImageData(tw,th);for(let row=0;row<th;row++){const src=row*tw*4,dst=(th-1-row)*tw*4;im.data.set(tilePixels.subarray(src,src+tw*4),dst)}ctx.putImageData(im,x,h-y-th)}n++;status.textContent=`${benchmark?'Benchmark':'Rendering'} ${n}/${total} tiles (${Math.round(100*n/total)}%)`;await yieldFrame()}}const seconds=(performance.now()-start)/1000;status.textContent=`${benchmark?'Benchmark':'Render'} completed\n${w}×${h}, depth ${$('depth').value}\n${seconds.toFixed(2)} seconds\n${(w*h/seconds/1e6).toFixed(3)} Mpixels/s\nNote: includes readback + JS tile overhead.`;if(out){const blob=await new Promise(resolve=>out.toBlob(resolve,'image/png'));if(!blob)throw Error('PNG encoding failed');const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`menger_depth${$('depth').value}_${w}x${h}.png`;a.click();setTimeout(()=>URL.revokeObjectURL(url),30000)}}catch(e){status.textContent='Render stopped: '+e.message}finally{gl.bindFramebuffer(gl.FRAMEBUFFER,null);if(res){gl.deleteFramebuffer(res.fb);gl.deleteTexture(res.tex)}job=null;$('render').disabled=$('bench').disabled=false;preview(true)}}
+async function render(benchmark=false){
+ if(job)return;
+ const w=benchmark?768:Math.floor(+$('outW').value),h=benchmark?512:Math.floor(+$('outH').value);
+ if(w<64||h<64||w>4096||h>4096){status.textContent='Use dimensions between 64 and 4096.';return;}
+ const max=gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+ if(w>max||h>max){status.textContent='Image exceeds GPU framebuffer limit: '+max;return;}
+ const run={cancel:false};job=run;$('render').disabled=$('bench').disabled=true;
+ let res=null;const start=performance.now();
+ try{
+  // Diagnostic safe path: ONE framebuffer and ONE draw call. No tile coordinates.
+  res=framebufferRect(w,h);gl.bindFramebuffer(gl.FRAMEBUFFER,res.fb);
+  gl.disable(gl.SCISSOR_TEST);gl.disable(gl.BLEND);
+  gl.useProgram(program);drawTile(w,h,w,h,0,0);gl.finish();
+  if(gl.isContextLost())throw Error('WebGL context lost');
+  const pixels=new Uint8Array(w*h*4);gl.pixelStorei(gl.PACK_ALIGNMENT,1);
+  gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
+  const err=gl.getError();if(err!==gl.NO_ERROR)throw Error('readPixels error '+err);
+  if(run.cancel)throw Error('Cancelled');
+  const seconds=(performance.now()-start)/1000;
+  status.textContent=`${benchmark?'Benchmark':'Render'} completed\n${w}×${h}, depth ${$('depth').value}\n${seconds.toFixed(2)} seconds\n${(w*h/seconds/1e6).toFixed(3)} Mpixels/s`;
+  if(!benchmark){
+   const out=document.createElement('canvas');out.width=w;out.height=h;
+   const ctx=out.getContext('2d');if(!ctx)throw Error('Canvas 2D unavailable');
+   const im=ctx.createImageData(w,h);
+   for(let row=0;row<h;row++)im.data.set(pixels.subarray(row*w*4,(row+1)*w*4),(h-1-row)*w*4);
+   ctx.putImageData(im,0,0);
+   const blob=await new Promise(resolve=>out.toBlob(resolve,'image/png'));
+   if(!blob)throw Error('PNG encoding failed');
+   const url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;
+   link.download=`menger_depth${$('depth').value}_${w}x${h}.png`;link.click();
+   setTimeout(()=>URL.revokeObjectURL(url),30000);
+  }
+ }catch(e){status.textContent='Render stopped: '+e.message}
+ finally{gl.bindFramebuffer(gl.FRAMEBUFFER,null);if(res){gl.deleteFramebuffer(res.fb);gl.deleteTexture(res.tex)}job=null;$('render').disabled=$('bench').disabled=false;preview(true)}
+}
+function framebufferRect(w,h){
+ const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
+ gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+ const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+ gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+ if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('Framebuffer incomplete');
+ return {fb,tex};
+}
 $('depth').addEventListener('input',()=>{$('depthValue').textContent=$('depth').value;preview()});for(const id of ['distance','tx','ty','tz'])$(id).addEventListener('change',preview);$('preview').onclick=preview;$('render').onclick=()=>render(false);$('bench').onclick=()=>render(true);$('cancel').onclick=()=>{if(job)job.cancel=true};$('reset').onclick=()=>{yaw=.65;pitch=.32;$('distance').value='2.8';for(const id of ['tx','ty','tz'])$(id).value='0';preview()};
 let drag=null;canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);drag={x:e.clientX,y:e.clientY}});canvas.addEventListener('pointermove',e=>{if(!drag||job)return;yaw+=(e.clientX-drag.x)*.008;pitch=Math.max(-1.45,Math.min(1.45,pitch+(e.clientY-drag.y)*.008));drag={x:e.clientX,y:e.clientY};preview()});canvas.addEventListener('pointerup',()=>drag=null);canvas.addEventListener('pointercancel',()=>drag=null);canvas.addEventListener('wheel',e=>{e.preventDefault();$('distance').value=Math.max(1e-7,settings().distance*Math.exp(e.deltaY*.001));preview()},{passive:false});let pinch=null;canvas.addEventListener('touchmove',e=>{if(e.touches.length===2&&!job){const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);if(pinch)$('distance').value=Math.max(1e-7,settings().distance*pinch/d);pinch=d;preview()}},{passive:true});canvas.addEventListener('touchend',()=>pinch=null);window.addEventListener('resize',()=>{if(!job)preview()});preview();
 </script></body></html>
