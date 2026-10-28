@@ -1,21 +1,20 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Menger Lab — WebGL2</title><style>
 :root{color-scheme:dark;font-family:system-ui,-apple-system,sans-serif}*{box-sizing:border-box}body{margin:0;background:#10141c;color:#e7edf5}header{padding:12px 16px;border-bottom:1px solid #354055}h1{font-size:19px;margin:0}small,.muted{color:#aab7ca}main{display:grid;grid-template-columns:minmax(0,1fr) 295px;min-height:calc(100dvh - 56px)}#view{width:100%;height:100%;min-height:400px;display:block;touch-action:none;background:#070b12}aside{padding:14px;overflow:auto;background:#1a2230}label{display:block;margin:12px 0 4px;font-size:13px}input,select,button{font:inherit;color:inherit}input,select{width:100%;padding:8px;background:#101824;border:1px solid #47556a;border-radius:6px}button{padding:9px 12px;border:1px solid #62748b;border-radius:6px;background:#2b3b52;cursor:pointer}button:disabled{opacity:.5}button.primary{background:#315e94}buttonrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}buttonrow button{flex:1}#status{white-space:pre-wrap;font:12px/1.5 ui-monospace,monospace;color:#c3d1e1;margin-top:14px}.note{font-size:12px;line-height:1.5;color:#b3bfd0} @media(max-width:760px){main{display:flex;flex-direction:column}#view{height:54dvh;min-height:280px}aside{overflow:visible}}
-</style></head><body><header><h1>Menger Lab <small>WebGL2 · exact traversal v0.4</small></h1></header><main><canvas id="view"></canvas><aside>
-<label>Iterations <output id="depthValue">8</output></label><input id="depth" type="range" min="0" max="24" value="8">
+</style></head><body><header><h1>Menger Lab <small>WebGL2 · ordered traversal v0.5</small></h1></header><main><canvas id="view"></canvas><aside>
+<label>Iterations <output id="depthValue">2</output></label><input id="depth" type="range" min="0" max="24" value="2">
 <label>Zoom (camera distance)</label><input id="distance" type="number" value="2.8" min="0.000001" step="any">
 <label>Look-at X</label><input id="tx" type="number" value="0" step="any">
 <label>Look-at Y</label><input id="ty" type="number" value="0" step="any">
 <label>Look-at Z</label><input id="tz" type="number" value="0" step="any">
-<label>Offline samples per pixel</label><select id="samples"><option value="1">1 — fast</option><option value="4" selected>4 — recommended</option></select>
-<label>Output width</label><input id="outW" type="number" min="64" max="8192" value="2048">
-<label>Output height</label><input id="outH" type="number" min="64" max="8192" value="2048">
-<label>Tile size</label><select id="tile"><option selected>256</option><option>512</option><option>1024</option></select>
+<label>Offline samples per pixel</label><select id="samples"><option value="1" selected>1 — fast</option><option value="4">4 — recommended</option></select>
+<label>Output width</label><input id="outW" type="number" min="64" max="8192" value="512">
+<label>Output height</label><input id="outH" type="number" min="64" max="8192" value="512">
 <buttonrow><button id="preview" class="primary">Preview</button><button id="render">Render PNG</button></buttonrow>
 <buttonrow><button id="bench">Benchmark</button><button id="cancel">Cancel</button><button id="reset">Reset camera</button></buttonrow>
 <div id="status" role="status">Initializing…</div>
-<p class="note">Drag to orbit, pinch or scroll to zoom. PNG export uses one framebuffer (no tiles), up to 4096 pixels per side. Offline supersampling is selectable. This version uses hierarchical cube traversal with floating-point coordinates: very deep levels remain limited by precision.</p>
-<p class="note">Geometry uses ray–box cell traversal instead of distance estimation. Intersections are exact within floating-point precision and iteration limits. Benchmark timings include GPU completion and pixel readback.</p>
+<p class="note">Drag to orbit, pinch or scroll to zoom. PNG export uses one framebuffer (no tiles), up to 4096 pixels per side. Offline supersampling is selectable. This version uses ordered hierarchical ray–box traversal. Floating-point precision still limits very deep levels. Start with depth 2 and 1 sample.</p>
+<p class="note">Each ray traverses retained subcubes front-to-back using an explicit stack. Rendering remains limited by float precision and a 2048-node traversal budget. Benchmark timings include GPU completion and pixel readback.</p>
 </aside></main>
 <script>
 'use strict';
@@ -31,62 +30,72 @@ uniform vec2 uFull,uOrigin; uniform int uDepth,uSamples;
 uniform vec3 uEye,uTarget; uniform float uFov;
 // Unit cube [-1,1]^3. Coordinates in the shader are highp floats.
 vec3 background(vec3 rd){return mix(vec3(.035,.05,.09),vec3(.10,.15,.23),clamp(rd.y*.5+.5,0.,1.));}
-// Intersect a box and return near and far t. Ray direction components are guarded.
-vec2 intersectBox(vec3 ro,vec3 rd,vec3 lo,vec3 hi){
- vec3 safe=sign(rd)*max(abs(rd),vec3(1.e-20));
- vec3 a=(lo-ro)/safe,b=(hi-ro)/safe;
- vec3 near3=min(a,b),far3=max(a,b);
- return vec2(max(near3.x,max(near3.y,near3.z)),min(far3.x,min(far3.y,far3.z)));
+// Slab intersection with the normal of the entering face.
+// For near-zero ray components use a large reciprocal; coordinates stay finite.
+vec2 slab(vec3 ro,vec3 rd,vec3 lo,vec3 hi,out vec3 enterNormal){
+ vec3 inv=vec3(
+  abs(rd.x)<1.e-9?1.e20:1./rd.x,
+  abs(rd.y)<1.e-9?1.e20:1./rd.y,
+  abs(rd.z)<1.e-9?1.e20:1./rd.z);
+ vec3 a=(lo-ro)*inv,b=(hi-ro)*inv;
+ vec3 nearV=min(a,b),farV=max(a,b);
+ float tNear=max(nearV.x,max(nearV.y,nearV.z));
+ float tFar=min(farV.x,min(farV.y,farV.z));
+ if(nearV.x>=nearV.y&&nearV.x>=nearV.z)enterNormal=vec3(-sign(rd.x),0.,0.);
+ else if(nearV.y>=nearV.z)enterNormal=vec3(0.,-sign(rd.y),0.);
+ else enterNormal=vec3(0.,0.,-sign(rd.z));
+ return vec2(tNear,tFar);
 }
-// Normal of the face crossed on entering the outer box.
-vec3 entryNormal(vec3 p,vec3 rd){
- vec3 d=abs(abs(p)-vec3(1.));
- if(d.x<=d.y&&d.x<=d.z)return vec3(-sign(rd.x),0.,0.);
- if(d.y<=d.z)return vec3(0.,-sign(rd.y),0.);
- return vec3(0.,0.,-sign(rd.z));
-}
-// Trace ray through the implicit 3x3x3 hierarchy. No voxel storage.
-// Each iteration either descends into a retained child or skips an empty child.
-// A retained leaf is a solid hit. This is not sphere tracing.
+// Explicit front-to-back traversal: each parent enumerates retained children,
+// chooses the next intersected child, and resumes after that child's exit.
+// No ray marching, no coordinate probe, no guessed face normals.
+// The arrays form a bounded explicit stack (GLSL ES disallows recursion).
 bool trace(vec3 ro,vec3 rd,out float tHit,out vec3 nHit){
- vec2 outer=intersectBox(ro,rd,vec3(-1.),vec3(1.));
- if(outer.x>outer.y||outer.y<0.)return false;
- float t=max(outer.x,0.);
- vec3 faceN=entryNormal(ro+rd*outer.x,rd);
- // Upper bound prevents shader hangs for pathological rays.
+ vec3 nOuter;
+ vec2 root=slab(ro,rd,vec3(-1.),vec3(1.),nOuter);
+ if(root.x>root.y||root.y<=0.)return false;
+ vec3 lows[25]; vec3 highs[25];
+ vec3 normals[25];
+ float cursors[25];float ends[25];
+ lows[0]=vec3(-1.);highs[0]=vec3(1.);
+ cursors[0]=max(root.x,0.);ends[0]=root.y;
+ normals[0]=nOuter;
+ int level=0;
  for(int visit=0;visit<2048;visit++){
-  if(t>outer.y)return false;
-  // A probe slightly beyond the boundary avoids selecting the previous cell.
-  // Epsilon scales with ray distance; below ~1e-6 geometry is not reliable.
-  float eps=max(2.e-6,abs(t)*1.e-7);
-  vec3 p=ro+rd*(t+eps);
-  if(any(greaterThan(abs(p),vec3(1.00001))))return false;
-  vec3 lo=vec3(-1.),hi=vec3(1.);
-  bool skipped=false;
-  for(int level=0;level<24;level++){
-   if(level>=uDepth)break;
-   vec3 size=(hi-lo)/3.;
-   vec3 cell=clamp(floor((p-lo)/size),vec3(0.),vec3(2.));
-   vec3 childLo=lo+cell*size,childHi=childLo+size;
-   int middles=int(cell.x==1.)+int(cell.y==1.)+int(cell.z==1.);
-   if(middles>=2){
-    vec2 interval=intersectBox(ro,rd,childLo,childHi);
-    if(interval.y<=t){return false;}
-    // Determine the exiting face. Its outward normal from the solid is
-    // opposite the ray's direction along the crossed axis.
-    vec3 safe=sign(rd)*max(abs(rd),vec3(1.e-20));
-    vec3 farT=max((childLo-ro)/safe,(childHi-ro)/safe);
-    if(farT.x<=farT.y&&farT.x<=farT.z)faceN=vec3(-sign(rd.x),0.,0.);
-    else if(farT.y<=farT.z)faceN=vec3(0.,-sign(rd.y),0.);
-    else faceN=vec3(0.,0.,-sign(rd.z));
-    t=interval.y;
-    skipped=true;
-    break;
+  if(level<0)return false;
+  if(cursors[level]>=ends[level]-1.e-7){level--;continue;}
+  if(level>=uDepth){tHit=cursors[level];nHit=normals[level];return true;}
+  vec3 lo=lows[level],hi=highs[level];
+  vec3 childSize=(hi-lo)/3.;
+  float cursor=cursors[level],endT=ends[level];
+  float best=1.e30,bestExit=0.;
+  vec3 bestLo=vec3(0.),bestHi=vec3(0.),bestNormal=vec3(0.);
+  bool found=false;
+  // Scan the 20 retained children, choosing the first in ray order.
+  for(int i=0;i<27;i++){
+   ivec3 c=ivec3(i%3,(i/3)%3,i/9);
+   int middle=int(c.x==1)+int(c.y==1)+int(c.z==1);
+   if(middle>=2)continue;
+   vec3 a=lo+vec3(c)*childSize,b=a+childSize;
+   vec3 n;vec2 interval=slab(ro,rd,a,b,n);
+   float nearT=max(interval.x,cursor),farT=min(interval.y,endT);
+   float tol=max(2.e-7,childSize.x*1.e-6);
+   if(farT<=nearT+tol)continue;
+   if(nearT<best){
+    found=true;best=nearT;bestExit=farT;
+    bestLo=a;bestHi=b;
+    bestNormal=interval.x>=cursor-tol?n:normals[level];
    }
-   lo=childLo;hi=childHi;
   }
-  if(!skipped){tHit=t;nHit=faceN;return true;}
+  if(!found){level--;continue;}
+  // Parent will continue AFTER this child's interval when we pop it.
+  cursors[level]=bestExit;
+  level++;
+  lows[level]=bestLo;highs[level]=bestHi;
+  cursors[level]=best;ends[level]=bestExit;
+  normals[level]=bestNormal;
  }
+ // Traversal budget exhausted: report miss, never a fabricated surface.
  return false;
 }
 vec3 shade(vec3 ro,vec3 rd){
